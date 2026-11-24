@@ -1,6 +1,6 @@
 {
-  "name": "Farplane Web — FFX HD Remaster Save Editor",
-  "description": "Browser-based save file editor for Final Fantasy X HD Remaster with automatic CRC-16-CCITT checksum repair.",
+  "name": "Spira Hook by Velius",
+  "description": "Browser-based save file editor and live memory trainer for Final Fantasy X HD Remaster with automatic CRC-16-CCITT checksum repair.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

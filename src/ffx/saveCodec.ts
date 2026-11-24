@@ -1,6 +1,7 @@
 import {
   CHARACTER_ABILITIES,
   CHARACTER_NAMES_DEFAULT,
+  EQUIP_NAMES_BY_CHAR,
   OVERDRIVE_MODES,
   OVERDRIVES_LIST,
   SPECIAL_ABILITIES_LIST,
@@ -736,6 +737,75 @@ export function writeEquipmentSlot(core: Uint8Array, item: EquipmentSlotData): v
   writeU16(core, base + 16, item.abilities[1]);
   writeU16(core, base + 18, item.abilities[2]);
   writeU16(core, base + 20, item.abilities[3]);
+}
+
+export function resolveEquipmentLabel(item: EquipmentSlotData): string {
+  if (!item.occupied && item.equippedBy === 0xff) {
+    return 'Empty Slot';
+  }
+  if (item.character <= 6) {
+    const names = EQUIP_NAMES_BY_CHAR[item.character];
+    if (names && item.nameId < names.length && item.nameId > 0) {
+      return names[item.nameId];
+    }
+  }
+  const charName = CHARACTER_NAMES_DEFAULT[item.character] ?? `Unit ${item.character}`;
+  return `${charName} ${item.type === 0 ? 'Weapon' : 'Armor'}`;
+}
+
+/**
+ * Equips an equipment slot (0..199) onto a character/Aeon (0..17), keeping both
+ * `EquipmentSlotData.equippedBy` and `PartyMemberData.equippedWeapon/equippedArmor` synchronized.
+ */
+export function equipGearOnCharacter(
+  core: Uint8Array,
+  slotIndex: number,
+  characterIndex: number
+): boolean {
+  if (slotIndex < 0 || slotIndex >= 200 || characterIndex < 0 || characterIndex >= 18) {
+    return false;
+  }
+  const targetSlot = readEquipmentSlot(core, slotIndex);
+  const gearType = targetSlot.type === 1 ? 1 : 0;
+
+  // Unequip any existing slot of the same type worn by this character
+  for (let s = 0; s < 200; s++) {
+    const existing = readEquipmentSlot(core, s);
+    if (s !== slotIndex && existing.equippedBy === characterIndex && existing.type === gearType) {
+      writeEquipmentSlot(core, { ...existing, equippedBy: 0xff });
+    }
+  }
+
+  // Mark target slot occupied & equipped by characterIndex
+  writeEquipmentSlot(core, {
+    ...targetSlot,
+    occupied: true,
+    equippedBy: characterIndex,
+  });
+
+  // Update character's equippedWeapon (+41) or equippedArmor (+42) pointer byte
+  const memberBase = PARTY_BASE + characterIndex * PARTY_STRIDE;
+  writeU8(core, memberBase + (gearType === 0 ? 41 : 42), slotIndex);
+  return true;
+}
+
+/**
+ * Unequips the weapon (type 0) or armor (type 1) from a character/Aeon (0..17).
+ */
+export function unequipGearFromCharacter(
+  core: Uint8Array,
+  characterIndex: number,
+  gearType: 0 | 1
+): void {
+  if (characterIndex < 0 || characterIndex >= 18) return;
+  for (let s = 0; s < 200; s++) {
+    const existing = readEquipmentSlot(core, s);
+    if (existing.equippedBy === characterIndex && existing.type === gearType) {
+      writeEquipmentSlot(core, { ...existing, equippedBy: 0xff });
+    }
+  }
+  const memberBase = PARTY_BASE + characterIndex * PARTY_STRIDE;
+  writeU8(core, memberBase + (gearType === 0 ? 41 : 42), 0xff);
 }
 
 export function readInventoryItem(core: Uint8Array, slot: number): InventoryItemSlot {

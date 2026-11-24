@@ -272,7 +272,7 @@ export default function App() {
           <div className="flex items-center gap-2 min-w-0">
             <FileCode2 className="w-5 h-5 text-sky-400 shrink-0" />
             <h1 className="text-sm sm:text-base font-semibold tracking-tight text-slate-100 truncate">
-              Farplane Web
+              Spira Hook by Velius
             </h1>
             {saveContainer && (
               <span className="hidden sm:inline text-sm text-slate-400 truncate">

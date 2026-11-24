@@ -1,14 +1,24 @@
 import {
+  EQUIP_BASE,
+  EQUIP_STRIDE,
+  EquipmentSlotData,
   MONSTER_ARENA_BASE,
+  PARTY_BASE,
+  PARTY_STRIDE,
+  equipGearOnCharacter,
   readBlitzballPlayer,
+  readEquipmentSlot,
   readPartyMember,
   readU32,
   readU8,
+  unequipGearFromCharacter,
   writeBlitzballPlayer,
+  writeEquipmentSlot,
   writePartyMember,
   writeU32,
   writeU8,
 } from './saveCodec';
+import { CHARACTER_NAMES_DEFAULT } from './tables';
 
 export type TrainerConnectionMode = 'disconnected' | 'connecting' | 'live-bridge' | 'sandbox';
 
@@ -52,7 +62,17 @@ export const FFX_LIVE_HOOKS: LiveMemoryHookSpec[] = [
     aobPattern: '81 C6 ?? ?? ?? ?? 83 7D 0C 00',
     aobByteOffset: 2,
     width: 'u32',
-    notes: 'Out-of-battle stats: +0x18 CurHP, +0x1C CurMP, +0x20 MaxHP, +0x24 MaxMP, +0x35 OD, +0x37 S.Lv.',
+    notes: 'Out-of-battle stats: +0x18 CurHP, +0x1C CurMP, +0x20 MaxHP, +0x24 MaxMP, +0x29 Weapon, +0x2A Armor, +0x35 OD, +0x37 S.Lv.',
+  },
+  {
+    id: 'equipment-base',
+    label: 'Equipment Inventory Block (200 × 22B)',
+    symbol: 'FFX_EquipmentBase',
+    staticOffsetHex: '0xD30F2C',
+    aobPattern: '81 C6 ?? ?? ?? ?? 83 7D 0C 00 (PartyBase - 0x1134)',
+    aobByteOffset: 2,
+    width: 'u8',
+    notes: 'Live 200-slot weapon & armor inventory array derived cleanly from FFX_PartyStatBase - 0x1134.',
   },
   {
     id: 'battle-party',
@@ -163,6 +183,34 @@ export interface TrainerWriteOp {
   category: 'economy' | 'vitals' | 'combat' | 'blitzball';
 }
 
+export interface LiveBattleEntity {
+  side: 'party' | 'enemy';
+  slot: number;
+  name: string;
+  hp: number;
+  maxHp: number;
+  mp: number;
+  maxMp: number;
+  overdrive: number;
+  overdriveMax: number;
+}
+
+export interface LiveBattleState {
+  active: boolean;
+  source: 'live-bridge' | 'sandbox';
+  party: LiveBattleEntity[];
+  enemies: LiveBattleEntity[];
+}
+
+export interface LiveCharacterEquipmentLoadout {
+  characterIndex: number;
+  name: string;
+  equippedWeaponSlot: number;
+  equippedArmorSlot: number;
+  weapon: EquipmentSlotData | null;
+  armor: EquipmentSlotData | null;
+}
+
 export interface LiveTelemetrySnapshot {
   pid: number | null;
   processName: string;
@@ -179,7 +227,11 @@ export interface LiveTelemetrySnapshot {
     overdrive: number;
     overdriveMax: number;
     sphereLevel: number;
+    equippedWeapon?: number;
+    equippedArmor?: number;
   }[];
+  battleParty: LiveBattleEntity[];
+  battleEnemies: LiveBattleEntity[];
   blitzball: {
     index: number;
     name: string;
@@ -480,6 +532,8 @@ export function readTelemetryFromCore(
       overdrive: m.overdriveLevel,
       overdriveMax: m.overdriveMax || 100,
       sphereLevel: m.sphereLevelCurrent,
+      equippedWeapon: m.equippedWeapon,
+      equippedArmor: m.equippedArmor,
     };
   });
 
@@ -508,30 +562,219 @@ export function readTelemetryFromCore(
     inBattle: false,
     roomId: readU8(core, 250) | (readU8(core, 251) << 8),
     party,
+    battleParty: [],
+    battleEnemies: [],
     blitzball,
     lastTickAt: Date.now(),
   };
 }
 
+function clampBattleInt(val: number, min: number, max: number): number {
+  if (!Number.isFinite(val)) return min;
+  return Math.max(min, Math.min(max, Math.trunc(val)));
+}
+
+/**
+ * Creates a realistic simulated active battle encounter from the loaded party roster
+ * so active-battle editing can be tested directly without FFX.exe running.
+ */
+export function createSimulatedBattle(core: Uint8Array): LiveBattleState {
+  const party: LiveBattleEntity[] = [0, 1, 2].map((slot) => {
+    const m = readPartyMember(core, slot);
+    return {
+      side: 'party',
+      slot,
+      name: m.customName || m.defaultName,
+      hp: m.currentHp,
+      maxHp: Math.max(1, m.currentHpMax),
+      mp: m.currentMp,
+      maxMp: m.currentMpMax,
+      overdrive: m.overdriveLevel,
+      overdriveMax: m.overdriveMax > 0 ? m.overdriveMax : 100,
+    };
+  });
+
+  const enemies: LiveBattleEntity[] = [
+    {
+      side: 'enemy',
+      slot: 0,
+      name: 'Fiend Slot #0 (Front)',
+      hp: 2400,
+      maxHp: 2400,
+      mp: 120,
+      maxMp: 120,
+      overdrive: 0,
+      overdriveMax: 100,
+    },
+    {
+      side: 'enemy',
+      slot: 1,
+      name: 'Fiend Slot #1 (Flank)',
+      hp: 8500,
+      maxHp: 8500,
+      mp: 260,
+      maxMp: 260,
+      overdrive: 0,
+      overdriveMax: 100,
+    },
+    {
+      side: 'enemy',
+      slot: 2,
+      name: 'Boss / Elite Slot #2',
+      hp: 65000,
+      maxHp: 65000,
+      mp: 999,
+      maxMp: 999,
+      overdrive: 0,
+      overdriveMax: 100,
+    },
+  ];
+
+  return {
+    active: true,
+    source: 'sandbox',
+    party,
+    enemies,
+  };
+}
+
+export function applyBattleEntityEdit(
+  battle: LiveBattleState,
+  side: 'party' | 'enemy',
+  slot: number,
+  patch: Partial<Pick<LiveBattleEntity, 'hp' | 'maxHp' | 'mp' | 'maxMp' | 'overdrive' | 'overdriveMax'>>
+): LiveBattleState {
+  const hpCap = side === 'party' ? 99999 : 99999999;
+  const updateList = (list: LiveBattleEntity[]) =>
+    list.map((ent) => {
+      if (ent.slot !== slot) return ent;
+      const maxHp = clampBattleInt(patch.maxHp ?? ent.maxHp, 1, hpCap);
+      const hp = clampBattleInt(patch.hp ?? ent.hp, 0, maxHp);
+      const maxMp = clampBattleInt(patch.maxMp ?? ent.maxMp, 0, 9999);
+      const mp = clampBattleInt(patch.mp ?? ent.mp, 0, maxMp);
+      const overdriveMax = clampBattleInt(patch.overdriveMax ?? ent.overdriveMax, 0, 255);
+      const overdrive = clampBattleInt(
+        patch.overdrive ?? ent.overdrive,
+        0,
+        overdriveMax > 0 ? overdriveMax : 255
+      );
+      return { ...ent, hp, maxHp, mp, maxMp, overdrive, overdriveMax };
+    });
+
+  return {
+    ...battle,
+    party: side === 'party' ? updateList(battle.party) : battle.party,
+    enemies: side === 'enemy' ? updateList(battle.enemies) : battle.enemies,
+  };
+}
+
+export type BattleBatchAction = 'heal_party' | 'fill_overdrive' | 'enemies_1hp' | 'enemies_0hp';
+
+export function applyBattleBatchAction(
+  battle: LiveBattleState,
+  action: BattleBatchAction
+): LiveBattleState {
+  if (action === 'heal_party') {
+    return {
+      ...battle,
+      party: battle.party.map((ent) => ({
+        ...ent,
+        hp: ent.maxHp,
+        mp: ent.maxMp,
+      })),
+    };
+  }
+  if (action === 'fill_overdrive') {
+    return {
+      ...battle,
+      party: battle.party.map((ent) => ({
+        ...ent,
+        overdrive: ent.overdriveMax > 0 ? ent.overdriveMax : 100,
+      })),
+    };
+  }
+  if (action === 'enemies_1hp') {
+    return {
+      ...battle,
+      enemies: battle.enemies.map((ent) => ({
+        ...ent,
+        hp: ent.maxHp > 0 ? 1 : 0,
+      })),
+    };
+  }
+  return {
+    ...battle,
+    enemies: battle.enemies.map((ent) => ({
+      ...ent,
+      hp: 0,
+    })),
+  };
+}
+
+/**
+ * Reads all 18 characters' & Aeons' live equipped Weapon and Armor loadouts
+ * from a save/memory core buffer.
+ */
+export function readLiveCharacterLoadouts(core: Uint8Array): LiveCharacterEquipmentLoadout[] {
+  return Array.from({ length: 18 }, (_, i) => {
+    const m = readPartyMember(core, i);
+    const weapon = m.equippedWeapon < 200 ? readEquipmentSlot(core, m.equippedWeapon) : null;
+    const armor = m.equippedArmor < 200 ? readEquipmentSlot(core, m.equippedArmor) : null;
+    return {
+      characterIndex: i,
+      name: m.customName || m.defaultName || CHARACTER_NAMES_DEFAULT[i] || `Unit ${i}`,
+      equippedWeaponSlot: m.equippedWeapon,
+      equippedArmorSlot: m.equippedArmor,
+      weapon,
+      armor,
+    };
+  });
+}
+
+/**
+ * Decodes a Base64 4,400-byte equipment snapshot and [weapon, armor] pair list
+ * streamed from `FFX.exe` into a copy of the core buffer.
+ */
+export function applyLiveEquipmentSnapshot(
+  core: Uint8Array,
+  equipBytes: Uint8Array,
+  partyEquipPairs?: number[][]
+): void {
+  const maxBytes = Math.min(200 * EQUIP_STRIDE, equipBytes.length);
+  for (let i = 0; i < maxBytes; i++) {
+    core[EQUIP_BASE + i] = equipBytes[i];
+  }
+  if (partyEquipPairs) {
+    for (let i = 0; i < Math.min(18, partyEquipPairs.length); i++) {
+      const pair = partyEquipPairs[i];
+      if (!Array.isArray(pair) || pair.length < 2) continue;
+      writeU8(core, PARTY_BASE + i * PARTY_STRIDE + 41, pair[0] & 0xff);
+      writeU8(core, PARTY_BASE + i * PARTY_STRIDE + 42, pair[1] & 0xff);
+    }
+  }
+}
+
+export { equipGearOnCharacter, unequipGearFromCharacter, writeEquipmentSlot, readEquipmentSlot };
+
 export function getBridgeLaunchCommand(): string {
-  return 'powershell -ExecutionPolicy Bypass -File "$HOME\\Downloads\\farplane-live-bridge.ps1"';
+  return 'powershell -ExecutionPolicy Bypass -File "$HOME\\Downloads\\spira-hook-bridge.ps1"';
 }
 
 /**
  * Generates a self-contained Windows PowerShell + inline C# Win32 WebSocket Companion Bridge
- * (`farplane-live-bridge.ps1`) that attaches directly to `FFX.exe` (Steam HD Remaster),
- * resolves Farplane's AOB signatures / fallback offsets, streams live telemetry, and applies
+ * (`spira-hook-bridge.ps1`) that attaches directly to `FFX.exe` (Steam HD Remaster),
+ * resolves FFX AOB signatures / fallback offsets, streams live telemetry, and applies
  * real-time memory writes & freezes over `ws://127.0.0.1:<port>/`.
  */
 export function generateWindowsBridgeScript(port = 28420): string {
-  return `# Farplane Web — Local Windows Live Memory Bridge for FFX.exe (HD Remaster Steam)
+  return `# Spira Hook by Velius — Local Windows Live Memory Bridge for FFX.exe (HD Remaster Steam)
 # How to run (Windows PowerShell, preferably "Run as Administrator"):
-#   powershell -ExecutionPolicy Bypass -File "$HOME\\Downloads\\farplane-live-bridge.ps1"
+#   powershell -ExecutionPolicy Bypass -File "$HOME\\Downloads\\spira-hook-bridge.ps1"
 # Keep this PowerShell window open while you click "Connect FFX.exe Bridge" in your browser.
 
 $Port = ${port}
 Write-Host ""
-Write-Host "=== Farplane Web -> FFX.exe Companion Bridge ===" -ForegroundColor Cyan
+Write-Host "=== Spira Hook by Velius -> FFX.exe Companion Bridge ===" -ForegroundColor Cyan
 Write-Host "1. Make sure FINAL FANTASY X (FFX.exe) is running on this PC." -ForegroundColor Gray
 Write-Host "2. Compiling tiny Win32 memory helper (takes ~2 seconds)..." -ForegroundColor Gray
 
@@ -547,7 +790,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 
-public class FarplaneBridge
+public class SpiraHookBridge
 {
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern IntPtr OpenProcess(int dwDesiredAccess, bool bInheritHandle, int dwProcessId);
@@ -593,8 +836,8 @@ public class FarplaneBridge
     {
         var listener = new TcpListener(IPAddress.Loopback, port);
         listener.Start();
-        Console.WriteLine("[Farplane Bridge] Ready! Listening on ws://127.0.0.1:" + port + "/");
-        Console.WriteLine("[Farplane Bridge] Return to your browser tab and click 'Connect FFX.exe Bridge'. Keep this window open (Ctrl+C to stop).");
+        Console.WriteLine("[Spira Hook Bridge] Ready! Listening on ws://127.0.0.1:" + port + "/");
+        Console.WriteLine("[Spira Hook Bridge] Return to your browser tab and click 'Connect FFX.exe Bridge'. Keep this window open (Ctrl+C to stop).");
 
         while (true)
         {
@@ -645,35 +888,145 @@ public class FarplaneBridge
             int addrGil = ScanAob(modBytes, modBase, "c3 c7 05 ?? ?? ?? ?? ff c9 9a 3b 3d ff c9 9a 3b", 3, 0xD307D8);
             int addrDebug = ScanAob(modBytes, modBase, "83 f8 01 75 09 80 3d ?? ?? ?? ?? 00 75 17 ff 75 08", 7, 0xD2A8F8);
             int addrParty = ScanAob(modBytes, modBase, "81 C6 ?? ?? ?? ?? 83 7D 0C 00", 2, 0xD32060);
+            int addrEquip = addrParty - 0x1134;
             int addrBattleParty = ScanAob(modBytes, modBase, "83 f8 1f 7d 0e 69 c0 90 0f 00 00 03 05 ?? ?? ?? ?? 5d c3", 13, 0xD334CC);
+            int addrBattleEnemy = ScanAob(modBytes, modBase, "0f b6 45 08 69 c0 90 0f 00 00 03 05 ?? ?? ?? ?? 5d c3", 12, 0xD34460);
             int addrBlitzData = ScanAob(modBytes, modBase, "6a 05 b9 78 00 00 00 bf ?? ?? ?? ?? 68 ?? ?? ?? ?? f3 ab", 8, 0x384670);
 
             SendText(stream, "{\\"type\\":\\"hello\\",\\"pid\\":" + proc.Id + ",\\"processName\\":\\"FFX.exe\\"}");
+            SendEquipmentSnapshot(stream, hProc, addrParty, addrEquip);
 
             while (client.Connected && !proc.HasExited)
             {
-                if (stream.DataAvailable)
+                while (stream.DataAvailable)
                 {
                     string msg = ReadText(stream);
                     if (msg != null)
                     {
-                        ApplyJsonCommand(hProc, msg, addrGil, addrDebug, addrParty, addrBattleParty, addrBlitzData);
+                        ApplyJsonCommand(stream, hProc, msg, addrGil, addrDebug, addrParty, addrEquip, addrBattleParty, addrBattleEnemy, addrBlitzData);
                     }
                 }
-                // Stream basic live Gil + Tidus HP telemetry
+                // Stream live Gil + Battle Entity arrays + Party equipped summary
                 var gilBuf = new byte[4];
                 ReadProcessMemory(hProc, (IntPtr)addrGil, gilBuf, 4, out readLen);
                 uint gil = BitConverter.ToUInt32(gilBuf, 0);
                 var bpBuf = new byte[4];
                 ReadProcessMemory(hProc, (IntPtr)addrBattleParty, bpBuf, 4, out readLen);
-                bool inBattle = BitConverter.ToInt32(bpBuf, 0) != 0;
-                SendText(stream, "{\\"type\\":\\"telemetry\\",\\"pid\\":" + proc.Id + ",\\"gil\\":" + gil + ",\\"inBattle\\":" + (inBattle ? "true" : "false") + "}");
+                int ptrParty = BitConverter.ToInt32(bpBuf, 0);
+                var beBuf = new byte[4];
+                ReadProcessMemory(hProc, (IntPtr)addrBattleEnemy, beBuf, 4, out readLen);
+                int ptrEnemy = BitConverter.ToInt32(beBuf, 0);
+                bool inBattle = ptrParty != 0;
+
+                var sb = new StringBuilder();
+                sb.Append("{\\"type\\":\\"telemetry\\",\\"pid\\":").Append(proc.Id)
+                  .Append(",\\"gil\\":").Append(gil)
+                  .Append(",\\"inBattle\\":").Append(inBattle ? "true" : "false")
+                  .Append(",\\"battleParty\\":").Append(BuildBattleJson(hProc, ptrParty, "party"))
+                  .Append(",\\"battleEnemies\\":").Append(BuildBattleJson(hProc, ptrEnemy, "enemy"))
+                  .Append(",\\"party\\":").Append(BuildPartyJson(hProc, addrParty))
+                  .Append("}");
+                SendText(stream, sb.ToString());
                 Thread.Sleep(250);
             }
             CloseHandle(hProc);
         }
         catch { }
         finally { try { client.Close(); } catch { } }
+    }
+
+    static string BuildPartyJson(IntPtr h, int addrParty)
+    {
+        var sb = new StringBuilder("[");
+        var pBuf = new byte[148];
+        int r;
+        for (int i = 0; i < 7; i++)
+        {
+            ReadProcessMemory(h, (IntPtr)(addrParty + i * 0x94), pBuf, 148, out r);
+            uint hp = BitConverter.ToUInt32(pBuf, 24);
+            uint mp = BitConverter.ToUInt32(pBuf, 28);
+            uint maxHp = BitConverter.ToUInt32(pBuf, 32);
+            uint maxMp = BitConverter.ToUInt32(pBuf, 36);
+            byte wep = pBuf[41];
+            byte arm = pBuf[42];
+            byte od = pBuf[53];
+            byte odMax = pBuf[54];
+            byte slv = pBuf[55];
+            if (i > 0) sb.Append(",");
+            sb.Append("{\\"index\\":").Append(i)
+              .Append(",\\"hp\\":").Append(hp)
+              .Append(",\\"maxHp\\":").Append(maxHp)
+              .Append(",\\"mp\\":").Append(mp)
+              .Append(",\\"maxMp\\":").Append(maxMp)
+              .Append(",\\"overdrive\\":").Append(od)
+              .Append(",\\"overdriveMax\\":").Append(odMax)
+              .Append(",\\"sphereLevel\\":").Append(slv)
+              .Append(",\\"equippedWeapon\\":").Append(wep)
+              .Append(",\\"equippedArmor\\":").Append(arm).Append("}");
+        }
+        sb.Append("]");
+        return sb.ToString();
+    }
+
+    static string BuildBattleJson(IntPtr h, int basePtr, string side)
+    {
+        if (basePtr == 0) return "[]";
+        var sb = new StringBuilder("[");
+        bool first = true;
+        var eBuf = new byte[0x5E0];
+        int r;
+        for (int i = 0; i < 8; i++)
+        {
+            ReadProcessMemory(h, (IntPtr)(basePtr + i * 0xF90), eBuf, eBuf.Length, out r);
+            if (r < 0x5D8) continue;
+            uint maxHp = BitConverter.ToUInt32(eBuf, 0x594);
+            if (maxHp == 0 || maxHp > 99999999) continue;
+            uint maxMp = BitConverter.ToUInt32(eBuf, 0x598);
+            byte od = eBuf[0x5BC];
+            byte odMax = eBuf[0x5BD];
+            uint hp = BitConverter.ToUInt32(eBuf, 0x5D0);
+            uint mp = BitConverter.ToUInt32(eBuf, 0x5D4);
+            if (!first) sb.Append(",");
+            first = false;
+            sb.Append("{\\"side\\":\\"").Append(side)
+              .Append("\\",\\"slot\\":").Append(i)
+              .Append(",\\"hp\\":").Append(hp)
+              .Append(",\\"maxHp\\":").Append(maxHp)
+              .Append(",\\"mp\\":").Append(mp)
+              .Append(",\\"maxMp\\":").Append(maxMp)
+              .Append(",\\"overdrive\\":").Append(od)
+              .Append(",\\"overdriveMax\\":").Append(odMax).Append("}");
+        }
+        sb.Append("]");
+        return sb.ToString();
+    }
+
+    static void SendEquipmentSnapshot(NetworkStream s, IntPtr h, int addrParty, int addrEquip)
+    {
+        var equipBytes = new byte[200 * 22];
+        int r;
+        ReadProcessMemory(h, (IntPtr)addrEquip, equipBytes, equipBytes.Length, out r);
+        string b64 = Convert.ToBase64String(equipBytes);
+        var pairs = new StringBuilder("[");
+        var buf = new byte[2];
+        for (int i = 0; i < 18; i++)
+        {
+            ReadProcessMemory(h, (IntPtr)(addrParty + i * 0x94 + 41), buf, 2, out r);
+            if (i > 0) pairs.Append(",");
+            pairs.Append("[").Append(buf[0]).Append(",").Append(buf[1]).Append("]");
+        }
+        pairs.Append("]");
+        SendText(s, "{\\"type\\":\\"equipment_snapshot\\",\\"equipB64\\":\\"" + b64 + "\\",\\"partyEquip\\":" + pairs.ToString() + "}");
+    }
+
+    static string ExtractString(string json, string key, string defVal)
+    {
+        var marker = "\\"" + key + "\\":\\"";
+        int idx = json.IndexOf(marker, StringComparison.Ordinal);
+        if (idx < 0) return defVal;
+        idx += marker.Length;
+        int end = json.IndexOf('"', idx);
+        return end > idx ? json.Substring(idx, end - idx) : defVal;
     }
 
     static int ExtractInt(string json, string key, int defVal)
@@ -693,12 +1046,128 @@ public class FarplaneBridge
         return json.IndexOf("\\"" + key + "\\":true", StringComparison.Ordinal) >= 0;
     }
 
+    static uint ReadU32(IntPtr h, int addr) { var b = new byte[4]; int r; ReadProcessMemory(h, (IntPtr)addr, b, 4, out r); return BitConverter.ToUInt32(b, 0); }
+    static int ReadI32(IntPtr h, int addr) { var b = new byte[4]; int r; ReadProcessMemory(h, (IntPtr)addr, b, 4, out r); return BitConverter.ToInt32(b, 0); }
     static void WriteU8(IntPtr h, int addr, byte v) { int w; WriteProcessMemory(h, (IntPtr)addr, new[] { v }, 1, out w); }
     static void WriteU16(IntPtr h, int addr, ushort v) { int w; WriteProcessMemory(h, (IntPtr)addr, BitConverter.GetBytes(v), 2, out w); }
     static void WriteU32(IntPtr h, int addr, uint v) { int w; WriteProcessMemory(h, (IntPtr)addr, BitConverter.GetBytes(v), 4, out w); }
 
-    static void ApplyJsonCommand(IntPtr h, string msg, int addrGil, int addrDebug, int addrParty, int addrBattleParty, int addrBlitzData)
+    static void ApplyJsonCommand(NetworkStream stream, IntPtr h, string msg, int addrGil, int addrDebug, int addrParty, int addrEquip, int addrBattleParty, int addrBattleEnemy, int addrBlitzData)
     {
+        string cmdType = ExtractString(msg, "type", "apply_cheats");
+        if (cmdType == "request_equipment")
+        {
+            SendEquipmentSnapshot(stream, h, addrParty, addrEquip);
+            return;
+        }
+        if (cmdType == "write_equipment_slot")
+        {
+            int slot = ExtractInt(msg, "slot", -1);
+            if (slot >= 0 && slot < 200)
+            {
+                int b = addrEquip + slot * 22;
+                WriteU8(h, b + 0, (byte)ExtractInt(msg, "nameId", 0));
+                WriteU8(h, b + 1, (byte)ExtractInt(msg, "name2", 0));
+                WriteU8(h, b + 2, ExtractBool(msg, "occupied") ? (byte)1 : (byte)0);
+                WriteU8(h, b + 3, (byte)ExtractInt(msg, "customizeMode", 0));
+                WriteU8(h, b + 4, (byte)ExtractInt(msg, "character", 0));
+                WriteU8(h, b + 5, (byte)ExtractInt(msg, "equipType", 0));
+                WriteU8(h, b + 6, (byte)ExtractInt(msg, "equippedBy", 255));
+                WriteU8(h, b + 7, 0);
+                WriteU8(h, b + 8, (byte)ExtractInt(msg, "damageFormula", 1));
+                WriteU8(h, b + 9, (byte)ExtractInt(msg, "attackPower", 0));
+                WriteU8(h, b + 10, (byte)ExtractInt(msg, "critical", 0));
+                WriteU8(h, b + 11, (byte)ExtractInt(msg, "abilityCount", 1));
+                WriteU16(h, b + 12, (ushort)ExtractInt(msg, "appearance", 255));
+                WriteU16(h, b + 14, (ushort)ExtractInt(msg, "ab0", 255));
+                WriteU16(h, b + 16, (ushort)ExtractInt(msg, "ab1", 255));
+                WriteU16(h, b + 18, (ushort)ExtractInt(msg, "ab2", 255));
+                WriteU16(h, b + 20, (ushort)ExtractInt(msg, "ab3", 255));
+                SendEquipmentSnapshot(stream, h, addrParty, addrEquip);
+            }
+            return;
+        }
+        if (cmdType == "equip_character")
+        {
+            int charIdx = ExtractInt(msg, "charIndex", -1);
+            int slot = ExtractInt(msg, "slot", 255);
+            int gType = ExtractInt(msg, "equipType", 0);
+            if (charIdx >= 0 && charIdx < 18)
+            {
+                var eqBuf = new byte[200 * 22];
+                int r;
+                ReadProcessMemory(h, (IntPtr)addrEquip, eqBuf, eqBuf.Length, out r);
+                for (int s = 0; s < 200; s++)
+                {
+                    if (eqBuf[s * 22 + 6] == charIdx && eqBuf[s * 22 + 5] == gType && s != slot)
+                        WriteU8(h, addrEquip + s * 22 + 6, 255);
+                }
+                if (slot >= 0 && slot < 200)
+                {
+                    WriteU8(h, addrEquip + slot * 22 + 2, 1);
+                    WriteU8(h, addrEquip + slot * 22 + 6, (byte)charIdx);
+                }
+                WriteU8(h, addrParty + charIdx * 0x94 + (gType == 0 ? 41 : 42), (byte)(slot >= 0 && slot < 200 ? slot : 255));
+                SendEquipmentSnapshot(stream, h, addrParty, addrEquip);
+            }
+            return;
+        }
+        if (cmdType == "edit_battle_entity")
+        {
+            string side = ExtractString(msg, "side", "party");
+            int slot = ExtractInt(msg, "slot", 0);
+            int basePtr = ReadI32(h, side == "enemy" ? addrBattleEnemy : addrBattleParty);
+            if (basePtr != 0 && slot >= 0 && slot < 8)
+            {
+                int ent = basePtr + slot * 0xF90;
+                WriteU32(h, ent + 0x594, (uint)Math.Max(1, ExtractInt(msg, "maxHp", 1)));
+                WriteU32(h, ent + 0x598, (uint)Math.Max(0, ExtractInt(msg, "maxMp", 0)));
+                WriteU32(h, ent + 0x5D0, (uint)Math.Max(0, ExtractInt(msg, "hp", 1)));
+                WriteU32(h, ent + 0x5D4, (uint)Math.Max(0, ExtractInt(msg, "mp", 0)));
+                WriteU8(h, ent + 0x5BC, (byte)Math.Max(0, Math.Min(255, ExtractInt(msg, "overdrive", 0))));
+                WriteU8(h, ent + 0x5BD, (byte)Math.Max(0, Math.Min(255, ExtractInt(msg, "overdriveMax", 100))));
+            }
+            return;
+        }
+        if (cmdType == "battle_batch")
+        {
+            string action = ExtractString(msg, "action", "");
+            int ptrParty = ReadI32(h, addrBattleParty);
+            int ptrEnemy = ReadI32(h, addrBattleEnemy);
+            if (ptrParty != 0 && (action == "heal_party" || action == "fill_overdrive"))
+            {
+                for (int i = 0; i < 8; i++)
+                {
+                    int ent = ptrParty + i * 0xF90;
+                    uint maxHp = ReadU32(h, ent + 0x594);
+                    if (maxHp == 0 || maxHp > 99999999) continue;
+                    if (action == "heal_party")
+                    {
+                        WriteU32(h, ent + 0x5D0, maxHp);
+                        WriteU32(h, ent + 0x5D4, ReadU32(h, ent + 0x598));
+                    }
+                    else
+                    {
+                        var odBuf = new byte[1]; int r;
+                        ReadProcessMemory(h, (IntPtr)(ent + 0x5BD), odBuf, 1, out r);
+                        WriteU8(h, ent + 0x5BC, odBuf[0] > 0 ? odBuf[0] : (byte)100);
+                    }
+                }
+            }
+            if (ptrEnemy != 0 && (action == "enemies_1hp" || action == "enemies_0hp"))
+            {
+                uint targetHp = action == "enemies_1hp" ? 1u : 0u;
+                for (int i = 0; i < 8; i++)
+                {
+                    int ent = ptrEnemy + i * 0xF90;
+                    uint maxHp = ReadU32(h, ent + 0x594);
+                    if (maxHp == 0 || maxHp > 99999999) continue;
+                    WriteU32(h, ent + 0x5D0, targetHp);
+                }
+            }
+            return;
+        }
+
         if (ExtractBool(msg, "freezeGil")) WriteU32(h, addrGil, (uint)Math.Max(0, ExtractInt(msg, "targetGil", 99999999)));
         WriteU8(h, addrDebug + 1, ExtractBool(msg, "infiniteHp") ? (byte)1 : (byte)0);
         WriteU8(h, addrDebug + 9, ExtractBool(msg, "infiniteMp") ? (byte)1 : (byte)0);
@@ -757,7 +1226,7 @@ public class FarplaneBridge
 "@
 
 Add-Type -TypeDefinition $CSharpSource -Language CSharp
-[FarplaneBridge]::Run($Port)
+[SpiraHookBridge]::Run($Port)
 `;
 }
 

@@ -9,6 +9,7 @@ import {
   Download,
   Flame,
   HelpCircle,
+  Package,
   Play,
   Plug,
   Shield,
@@ -20,31 +21,49 @@ import {
   Zap,
 } from 'lucide-react';
 import {
+  BattleBatchAction,
   DEFAULT_TRAINER_CONFIG,
   FFX_LIVE_HOOKS,
+  LiveBattleEntity,
+  LiveBattleState,
   LiveTelemetrySnapshot,
   LiveTrainerConfig,
   TrainerConnectionMode,
+  applyBattleBatchAction,
+  applyBattleEntityEdit,
+  applyLiveEquipmentSnapshot,
   applyTrainerToCore,
   computeTrainerOperations,
+  createSimulatedBattle,
+  equipGearOnCharacter,
   generateWindowsBridgeScript,
   getBridgeLaunchCommand,
   readTelemetryFromCore,
   simulateActiveGameDrainEvent,
+  unequipGearFromCharacter,
+  writeEquipmentSlot,
 } from '../ffx/liveTrainer';
+import { EquipmentSlotData } from '../ffx/saveCodec';
+import { LiveBattleEditor } from './LiveBattleEditor';
+import { LiveEquipmentPanel } from './LiveEquipmentPanel';
 
 interface LiveTrainerPanelProps {
   core: Uint8Array;
   onUpdateCore: (mutator: (draft: Uint8Array) => void) => void;
 }
 
+type LiveHookSubTab = 'cheats' | 'battle' | 'equipment';
+
 export const LiveTrainerPanel: React.FC<LiveTrainerPanelProps> = ({ core, onUpdateCore }) => {
+  const [subTab, setSubTab] = useState<LiveHookSubTab>('cheats');
   const [config, setConfig] = useState<LiveTrainerConfig>(DEFAULT_TRAINER_CONFIG);
   const [mode, setMode] = useState<TrainerConnectionMode>('disconnected');
   const [wsUrl, setWsUrl] = useState('ws://127.0.0.1:28420');
   const [bridgeStatusMsg, setBridgeStatusMsg] = useState<string | null>(null);
   const [bridgeError, setBridgeError] = useState<string | null>(null);
   const [liveTelemetry, setLiveTelemetry] = useState<LiveTelemetrySnapshot | null>(null);
+  const [simBattle, setSimBattle] = useState<LiveBattleState | null>(null);
+  const [liveEquipCore, setLiveEquipCore] = useState<Uint8Array | null>(null);
   const [ticksApplied, setTicksApplied] = useState(0);
   const [showHookTable, setShowHookTable] = useState(false);
   const [showSetupGuide, setShowSetupGuide] = useState(true);
@@ -61,6 +80,26 @@ export const LiveTrainerPanel: React.FC<LiveTrainerPanelProps> = ({ core, onUpda
 
   const telemetry = mode === 'live-bridge' && liveTelemetry ? liveTelemetry : coreTelemetry;
   const activeOps = useMemo(() => computeTrainerOperations(config), [config]);
+
+  const activeBattleState: LiveBattleState | null = useMemo(() => {
+    if (mode === 'live-bridge' && telemetry.inBattle && (telemetry.battleParty.length > 0 || telemetry.battleEnemies.length > 0)) {
+      return {
+        active: true,
+        source: 'live-bridge',
+        party: telemetry.battleParty.map((ent) => ({
+          ...ent,
+          name: telemetry.party[ent.slot]?.name ?? `Ally #${ent.slot}`,
+        })),
+        enemies: telemetry.battleEnemies.map((ent) => ({
+          ...ent,
+          name: `Enemy Target #${ent.slot}`,
+        })),
+      };
+    }
+    return simBattle;
+  }, [mode, telemetry, simBattle]);
+
+  const effectiveEquipCore = mode === 'live-bridge' && liveEquipCore ? liveEquipCore : core;
 
   // Clean up WebSocket on unmount
   useEffect(() => {
@@ -109,6 +148,7 @@ export const LiveTrainerPanel: React.FC<LiveTrainerPanelProps> = ({ core, onUpda
         setMode('live-bridge');
         setBridgeStatusMsg('WebSocket connected. Waiting for FFX.exe handshake...');
         ws.send(JSON.stringify({ type: 'apply_cheats', ...configRef.current }));
+        ws.send(JSON.stringify({ type: 'request_equipment' }));
       };
 
       ws.onmessage = (evt) => {
@@ -122,16 +162,37 @@ export const LiveTrainerPanel: React.FC<LiveTrainerPanelProps> = ({ core, onUpda
               processName: msg.processName ?? 'FFX.exe',
               lastTickAt: Date.now(),
             }));
+          } else if (msg.type === 'equipment_snapshot' && typeof msg.equipB64 === 'string') {
+            const rawStr = window.atob(msg.equipB64);
+            const equipBytes = new Uint8Array(rawStr.length);
+            for (let i = 0; i < rawStr.length; i++) {
+              equipBytes[i] = rawStr.charCodeAt(i);
+            }
+            const nextCore = core.slice();
+            applyLiveEquipmentSnapshot(nextCore, equipBytes, msg.partyEquip);
+            setLiveEquipCore(nextCore);
           } else if (msg.type === 'telemetry') {
             setTicksApplied((n) => n + 1);
-            setLiveTelemetry((prev) => ({
-              ...(prev ?? coreTelemetry),
-              pid: msg.pid ?? prev?.pid ?? null,
-              processName: 'FFX.exe',
-              gil: typeof msg.gil === 'number' ? msg.gil : prev?.gil ?? coreTelemetry.gil,
-              inBattle: Boolean(msg.inBattle),
-              lastTickAt: Date.now(),
-            }));
+            setLiveTelemetry((prev) => {
+              const base = prev ?? coreTelemetry;
+              const nextParty = Array.isArray(msg.party)
+                ? base.party.map((u) => {
+                    const liveU = msg.party.find((p: { index: number }) => p.index === u.index);
+                    return liveU ? { ...u, ...liveU } : u;
+                  })
+                : base.party;
+              return {
+                ...base,
+                pid: msg.pid ?? prev?.pid ?? null,
+                processName: 'FFX.exe',
+                gil: typeof msg.gil === 'number' ? msg.gil : base.gil,
+                inBattle: Boolean(msg.inBattle),
+                party: nextParty,
+                battleParty: Array.isArray(msg.battleParty) ? msg.battleParty : base.battleParty,
+                battleEnemies: Array.isArray(msg.battleEnemies) ? msg.battleEnemies : base.battleEnemies,
+                lastTickAt: Date.now(),
+              };
+            });
           } else if (msg.type === 'error') {
             setBridgeError(msg.message || 'Bridge reported an error.');
           }
@@ -142,7 +203,7 @@ export const LiveTrainerPanel: React.FC<LiveTrainerPanelProps> = ({ core, onUpda
 
       ws.onerror = () => {
         setBridgeError(
-          `Unable to reach local bridge at ${wsUrl}. Download and run farplane-live-bridge.ps1 on Windows while FFX.exe is open, or use Sandbox Loop to test trainer locks in-browser.`
+          `Unable to reach local bridge at ${wsUrl}. Download and run spira-hook-bridge.ps1 on Windows while FFX.exe is open, or use Sandbox Loop to test trainer locks in-browser.`
         );
         setMode('disconnected');
         wsRef.current = null;
@@ -219,12 +280,12 @@ export const LiveTrainerPanel: React.FC<LiveTrainerPanelProps> = ({ core, onUpda
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = 'farplane-live-bridge.ps1';
+    link.download = 'spira-hook-bridge.ps1';
     document.body.appendChild(link);
     link.click();
     link.remove();
     URL.revokeObjectURL(url);
-    setBridgeStatusMsg('Downloaded farplane-live-bridge.ps1 for Windows FFX.exe.');
+    setBridgeStatusMsg('Downloaded spira-hook-bridge.ps1 for Windows FFX.exe.');
   };
 
   const launchCmd = getBridgeLaunchCommand();
@@ -244,6 +305,132 @@ export const LiveTrainerPanel: React.FC<LiveTrainerPanelProps> = ({ core, onUpda
     setConfig((prev) => ({ ...prev, [key]: value }));
   };
 
+  const handleEditBattleEntity = (
+    side: 'party' | 'enemy',
+    slot: number,
+    patch: Partial<Pick<LiveBattleEntity, 'hp' | 'maxHp' | 'mp' | 'maxMp' | 'overdrive' | 'overdriveMax'>>
+  ) => {
+    if (mode === 'live-bridge' && wsRef.current && wsRef.current.readyState === WebSocket.OPEN && telemetry.inBattle) {
+      const current = activeBattleState?.[side === 'party' ? 'party' : 'enemies'].find(
+        (e) => e.slot === slot
+      );
+      if (current) {
+        const merged = { ...current, ...patch };
+        wsRef.current.send(
+          JSON.stringify({
+            type: 'edit_battle_entity',
+            side,
+            slot,
+            hp: merged.hp,
+            maxHp: merged.maxHp,
+            mp: merged.mp,
+            maxMp: merged.maxMp,
+            overdrive: merged.overdrive,
+            overdriveMax: merged.overdriveMax,
+          })
+        );
+        setBridgeStatusMsg(`Updated live ${side} slot #${slot} in FFX.exe battle memory.`);
+      }
+      return;
+    }
+
+    setSimBattle((prev) => (prev ? applyBattleEntityEdit(prev, side, slot, patch) : prev));
+  };
+
+  const handleBattleBatchAction = (action: BattleBatchAction) => {
+    if (mode === 'live-bridge' && wsRef.current && wsRef.current.readyState === WebSocket.OPEN && telemetry.inBattle) {
+      wsRef.current.send(JSON.stringify({ type: 'battle_batch', action }));
+      setBridgeStatusMsg(`Sent battle batch override (${action}) to FFX.exe.`);
+      return;
+    }
+    setSimBattle((prev) => (prev ? applyBattleBatchAction(prev, action) : prev));
+    setBridgeStatusMsg(`Applied battle override (${action}) to active combat simulation.`);
+  };
+
+  const handleWriteLiveEquipmentSlot = (slot: EquipmentSlotData) => {
+    if (mode === 'live-bridge' && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'write_equipment_slot',
+          slot: slot.slot,
+          nameId: slot.nameId,
+          name2: slot.name2,
+          occupied: slot.occupied,
+          customizeMode: slot.customizeMode,
+          character: slot.character,
+          equipType: slot.type,
+          equippedBy: slot.equippedBy,
+          damageFormula: slot.damageFormula,
+          attackPower: slot.attackPower,
+          critical: slot.critical,
+          abilityCount: slot.abilityCount,
+          appearance: slot.appearance,
+          ab0: slot.abilities[0],
+          ab1: slot.abilities[1],
+          ab2: slot.abilities[2],
+          ab3: slot.abilities[3],
+        })
+      );
+      setLiveEquipCore((prev) => {
+        const next = (prev ?? core).slice();
+        writeEquipmentSlot(next, slot);
+        return next;
+      });
+      setBridgeStatusMsg(`Wrote equipment Slot #${slot.slot} to FFX.exe RAM.`);
+      return;
+    }
+    onUpdateCore((d) => writeEquipmentSlot(d, slot));
+    setBridgeStatusMsg(`Updated equipment Slot #${slot.slot} in active core.`);
+  };
+
+  const handleEquipLiveCharacter = (charIndex: number, slotIndex: number, gearType: 0 | 1) => {
+    if (mode === 'live-bridge' && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'equip_character',
+          charIndex,
+          slot: slotIndex,
+          equipType: gearType,
+        })
+      );
+      setLiveEquipCore((prev) => {
+        const next = (prev ?? core).slice();
+        equipGearOnCharacter(next, slotIndex, charIndex);
+        return next;
+      });
+      setBridgeStatusMsg(`Equipped Slot #${slotIndex} onto Unit #${charIndex} in FFX.exe.`);
+      return;
+    }
+    onUpdateCore((d) => {
+      equipGearOnCharacter(d, slotIndex, charIndex);
+    });
+    setBridgeStatusMsg(`Equipped Slot #${slotIndex} onto Unit #${charIndex}.`);
+  };
+
+  const handleUnequipLiveCharacter = (charIndex: number, gearType: 0 | 1) => {
+    if (mode === 'live-bridge' && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'equip_character',
+          charIndex,
+          slot: 255,
+          equipType: gearType,
+        })
+      );
+      setLiveEquipCore((prev) => {
+        const next = (prev ?? core).slice();
+        unequipGearFromCharacter(next, charIndex, gearType);
+        return next;
+      });
+      setBridgeStatusMsg(`Unequipped ${gearType === 0 ? 'Weapon' : 'Armor'} from Unit #${charIndex} in FFX.exe.`);
+      return;
+    }
+    onUpdateCore((d) => {
+      unequipGearFromCharacter(d, charIndex, gearType);
+    });
+    setBridgeStatusMsg(`Unequipped ${gearType === 0 ? 'Weapon' : 'Armor'} from Unit #${charIndex}.`);
+  };
+
   return (
     <div className="space-y-6">
       {/* Page Title & Live Loop Status */}
@@ -253,7 +440,7 @@ export const LiveTrainerPanel: React.FC<LiveTrainerPanelProps> = ({ core, onUpda
             Live Game Hook &amp; Trainer
           </h2>
           <p className="text-sm text-slate-400 mt-1">
-            Attach to an active <code className="font-mono text-slate-200">FFX.exe</code> process via the local Windows Companion Bridge, or run a live freeze loop against your loaded save buffer.
+            Attach to an active <code className="font-mono text-slate-200">FFX.exe</code> process to freeze cheats, edit active battle HP/MP/Overdrive, and view or customize equipment on characters and in inventory.
           </p>
         </div>
 
@@ -290,6 +477,33 @@ export const LiveTrainerPanel: React.FC<LiveTrainerPanelProps> = ({ core, onUpda
         </div>
       </div>
 
+      {/* Live Game Hook Sub-navigation */}
+      <div className="flex flex-wrap items-center gap-2 border-b border-slate-800 pb-3">
+        {[
+          { id: 'cheats' as const, label: 'Cheats & Telemetry', icon: Activity },
+          { id: 'battle' as const, label: 'Active Battle Editor', icon: Swords },
+          { id: 'equipment' as const, label: 'Live Equipment (Chars & Bag)', icon: Package },
+        ].map((tab) => {
+          const Icon = tab.icon;
+          const active = subTab === tab.id;
+          return (
+            <button
+              key={tab.id}
+              type="button"
+              onClick={() => setSubTab(tab.id)}
+              className={`px-3 py-1.5 rounded text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer ${
+                active
+                  ? 'bg-slate-800 text-sky-300 border border-slate-700'
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900 border border-transparent'
+              }`}
+            >
+              <Icon className="w-3.5 h-3.5" />
+              {tab.label}
+            </button>
+          );
+        })}
+      </div>
+
       {/* Process Bridge Connection Bar */}
       <section className="bg-slate-900 border border-slate-800 rounded-md p-5 space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
@@ -319,16 +533,18 @@ export const LiveTrainerPanel: React.FC<LiveTrainerPanelProps> = ({ core, onUpda
                 </span>
               )}
             </div>
-            <button
-              type="button"
-              onClick={() => setShowSetupGuide((v) => !v)}
-              aria-expanded={showSetupGuide}
-              className="px-2.5 py-1 rounded border border-slate-700 bg-slate-950 hover:bg-slate-800 text-xs text-sky-300 font-medium inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              <BookOpen className="w-3.5 h-3.5" />
-              {showSetupGuide ? 'Hide Setup Guide' : 'Beginner Setup Guide'}
-              {showSetupGuide ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
-            </button>
+            {subTab === 'cheats' && (
+              <button
+                type="button"
+                onClick={() => setShowSetupGuide((v) => !v)}
+                aria-expanded={showSetupGuide}
+                className="px-2.5 py-1 rounded border border-slate-700 bg-slate-950 hover:bg-slate-800 text-xs text-sky-300 font-medium inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <BookOpen className="w-3.5 h-3.5" />
+                {showSetupGuide ? 'Hide Setup Guide' : 'Beginner Setup Guide'}
+                {showSetupGuide ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+              </button>
+            )}
           </div>
         </div>
 
@@ -416,7 +632,7 @@ export const LiveTrainerPanel: React.FC<LiveTrainerPanelProps> = ({ core, onUpda
         )}
 
         {/* Beginner Step-by-Step Setup Guide */}
-        {showSetupGuide && (
+        {subTab === 'cheats' && showSetupGuide && (
           <div className="border-t border-slate-800 pt-4 space-y-4">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
               <div>
@@ -444,7 +660,7 @@ export const LiveTrainerPanel: React.FC<LiveTrainerPanelProps> = ({ core, onUpda
               <div className="bg-slate-950/70 border border-slate-800 rounded p-3.5 space-y-1.5">
                 <div className="text-xs font-semibold text-sky-400">Step 2 · Save the Bridge</div>
                 <p className="text-xs text-slate-300 leading-relaxed">
-                  Click <strong className="text-slate-100">Download Bridge (.ps1)</strong> above and save <code className="font-mono text-slate-200">farplane-live-bridge.ps1</code> into your default <strong className="text-slate-100">Downloads</strong> folder.
+                  Click <strong className="text-slate-100">Download Bridge (.ps1)</strong> above and save <code className="font-mono text-slate-200">spira-hook-bridge.ps1</code> into your default <strong className="text-slate-100">Downloads</strong> folder.
                 </p>
                 <p className="text-[11px] text-slate-400">
                   Do <em>not</em> double-click the file—Windows blocks double-clicking unsigned <code className="font-mono">.ps1</code> files by default.
@@ -495,7 +711,7 @@ export const LiveTrainerPanel: React.FC<LiveTrainerPanelProps> = ({ core, onUpda
                   <span className="text-slate-200 font-medium">&ldquo;FFX.exe not found&rdquo; / Access Denied:</span> Start FFX before toggling cheats, and verify the PowerShell title bar says <strong className="text-slate-200">Administrator: Windows PowerShell</strong>.
                 </div>
                 <div>
-                  <span className="text-slate-200 font-medium">Saved outside Downloads folder?</span> Replace <code className="font-mono text-slate-300">$HOME\Downloads\farplane-live-bridge.ps1</code> in the command with the path where you saved the file.
+                  <span className="text-slate-200 font-medium">Saved outside Downloads folder?</span> Replace <code className="font-mono text-slate-300">$HOME\Downloads\spira-hook-bridge.ps1</code> in the command with the path where you saved the file.
                 </div>
               </div>
             </div>
@@ -503,7 +719,44 @@ export const LiveTrainerPanel: React.FC<LiveTrainerPanelProps> = ({ core, onUpda
         )}
       </section>
 
+      {subTab === 'battle' && (
+        <LiveBattleEditor
+          isBridgeConnected={mode === 'live-bridge'}
+          inLiveBattle={telemetry.inBattle}
+          battleState={activeBattleState}
+          onStartSimulatedBattle={() => {
+            setSimBattle(createSimulatedBattle(core));
+            setBridgeStatusMsg('Simulated active battle encounter started.');
+          }}
+          onEndSimulatedBattle={() => {
+            setSimBattle(null);
+            setBridgeStatusMsg('Ended simulated battle encounter.');
+          }}
+          onEditEntity={handleEditBattleEntity}
+          onBatchAction={handleBattleBatchAction}
+          statusMessage={bridgeStatusMsg}
+        />
+      )}
+
+      {subTab === 'equipment' && (
+        <LiveEquipmentPanel
+          isBridgeConnected={mode === 'live-bridge'}
+          equipCore={effectiveEquipCore}
+          onRefreshFromBridge={() => {
+            if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+              wsRef.current.send(JSON.stringify({ type: 'request_equipment' }));
+              setBridgeStatusMsg('Requested live equipment snapshot from FFX.exe.');
+            }
+          }}
+          onWriteSlot={handleWriteLiveEquipmentSlot}
+          onEquipCharacter={handleEquipLiveCharacter}
+          onUnequipCharacter={handleUnequipLiveCharacter}
+          statusMessage={bridgeStatusMsg}
+        />
+      )}
+
       {/* Live Trainer Cheats Grid */}
+      {subTab === 'cheats' && (
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
         {/* Column 1: Economy, Vitals & Limit Break, Combat */}
         <div className="space-y-6">
@@ -837,6 +1090,7 @@ export const LiveTrainerPanel: React.FC<LiveTrainerPanelProps> = ({ core, onUpda
           </section>
         </div>
       </div>
+      )}
 
       {/* Collapsible Verified Memory Hook & AOB Table */}
       <section className="bg-slate-900 border border-slate-800 rounded-md overflow-hidden">

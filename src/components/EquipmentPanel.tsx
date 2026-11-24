@@ -243,8 +243,8 @@ export const EquipmentPanel: React.FC<EquipmentPanelProps> = ({ core, onUpdateCo
                     attackPower: isWeapon ? 255 : 0,
                     critical: isWeapon ? 25 : 0,
                     abilities: isWeapon
-                      ? [0x801a, 0x801b, 0x800f, 0x8074] // Break Damage Limit, Triple Overdrive, Evade & Counter, Magic Booster
-                      : [0x805e, 0x805d, 0x8056, 0x8055], // Break HP Limit, Ribbon, Auto-Haste, Auto-Protect
+                      ? [32793, 32783, 32772, 32774] // Break Damage Limit, Triple Overdrive, Evade & Counter, Magic Booster
+                      : [32791, 32896, 32854, 32853], // Break HP Limit, Ribbon, Auto-Haste, Auto-Protect
                   });
                   setNotice(
                     isWeapon
